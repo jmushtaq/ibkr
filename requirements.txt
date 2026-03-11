@@ -1,0 +1,24 @@
+Django~=5.2.8
+django-confy==1.0.4
+django-extensions==3.2.3
+ipython==8.26.0
+psycopg2-binary==2.9.10
+dj-database-url==0.5.0
+python-dateutil==2.9.0.post0
+
+# Needed for shell_plus crash issue
+jedi==0.17.2
+parso==0.7.1
+
+# Interative Broker API
+# DOWNLOAD from TWS - https://www.interactivebrokers.com/en/trading/download-tws.php?p=stable 
+# AND manually copy to venv/../../ibapi
+#
+# ibapi==9.81.1.post1
+# pyEX==0.5.0
+# ib-insync==0.9.81
+
+protobuf==7.34.0
+
+# pip install -U setuptools
+# And then: pip install ujson
