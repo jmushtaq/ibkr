@@ -3,6 +3,8 @@
 Historical Data Downloader for Interactive Brokers
 Downloads OHLCV data for multiple symbols and saves to CSV files.
 Supports chunked downloads for higher granularities.
+
+python utils/historical_price_downloader.py --year 2022 --symbols "AAPL" --granularity 1min --output-dir ./data
 """
 
 from ibapi.client import EClient
