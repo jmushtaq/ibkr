@@ -8,6 +8,12 @@ python-dateutil==2.9.0.post0
 requests>=2.28.0
 pandas>=1.5.0
 
+# SEC CIK Mapper (primary source) [citation:7]
+sec-cik-mapper>=1.0.0
+
+# Yahoo Finance (secondary source)
+yfinance>=0.2.0
+
 # Needed for shell_plus crash issue
 jedi==0.17.2
 parso==0.7.1

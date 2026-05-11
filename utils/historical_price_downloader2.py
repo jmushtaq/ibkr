@@ -5,13 +5,10 @@ Downloads OHLCV data for multiple symbols and saves to CSV files.
 Supports chunked downloads for higher granularities and year ranges.
 
 To Run:
-    python utils/historical_price_downloader.py --year 2022 --symbols "AAPL" --granularity 1min --output-dir ./data
+    python utils/historical_price_downloader.py --year 2025 --symbols "AAPL" --granularity 1min --output-dir ./data
 
-    # Year range
-    python historical_price_downloader.py --year 2001-2026 --tickers-file ./data/spy_tickers/tickers_combined_unique.csv --granularity 1D
-
-    # Resume across multiple years
-    python historical_price_downloader.py --year 2001-2026 --tickers-file ./data/spy_tickers/tickers_combined_unique.csv --granularity 1D --resume
+    # For actual historical data (not current year)
+    python utils/historical_price_downloader.py --year 2024 --symbols "AAPL" --granularity 1min --output-dir ./data
 """
 
 from ibapi.client import EClient
@@ -29,6 +26,7 @@ from typing import List, Set, Tuple, Dict
 import queue
 from dateutil.relativedelta import relativedelta
 import glob
+import signal
 
 class IBHistoricalDownloader(EWrapper, EClient):
     def __init__(self, symbols: List[str], year: int, granularity: str, output_dir: str, resume: bool = False):
@@ -50,7 +48,7 @@ class IBHistoricalDownloader(EWrapper, EClient):
         self.data_received = False
         self.connected = False
         self.chunk_end_date = None
-        self.all_bars = []
+        self.all_bars = []  # Will store bars for current symbol
         self.expected_chunks = 0
         self.chunks_received = 0
         self.symbol_start_time = None
@@ -63,6 +61,8 @@ class IBHistoricalDownloader(EWrapper, EClient):
         self.year_complete = False
         self.total_symbols_processed = 0
         self.total_symbols_successful = 0
+        self.pending_requests = {}  # Track pending requests per symbol
+        self.current_req_id = None
 
         # Setup logging
         self.setup_logging()
@@ -123,7 +123,8 @@ class IBHistoricalDownloader(EWrapper, EClient):
 
     def get_expected_min_rows(self) -> int:
         """Get minimum expected rows for a complete download"""
-        trading_days = 252
+        # This is a rough estimate - actual may vary based on trading days
+        trading_days = 252  # Approximate trading days per year
 
         if self.granularity == "1D":
             return trading_days
@@ -162,7 +163,11 @@ class IBHistoricalDownloader(EWrapper, EClient):
                         row_count = len(lines) - 1
                         expected_min_rows = self.get_expected_min_rows()
 
-                        if row_count >= expected_min_rows:
+                        # For current year, accept any data
+                        if self.year == datetime.now().year:
+                            downloaded.add(symbol)
+                            self.logger.info(f"Found existing data for {symbol} ({row_count} rows)")
+                        elif row_count >= expected_min_rows:
                             downloaded.add(symbol)
                             self.logger.info(f"Found complete data for {symbol} ({row_count} rows)")
                         else:
@@ -245,11 +250,13 @@ class IBHistoricalDownloader(EWrapper, EClient):
         self.current_retry = 0
         self.symbol_start_time = time.time()
         self.data_received = False
+        self.pending_requests = {}  # Reset pending requests for this symbol
 
         self.expected_chunks = self.granularity_map[self.granularity]["chunks_per_year"]
 
         self.logger.info(f"Starting download for {self.current_symbol} (expected {self.expected_chunks} chunks)")
 
+        # Start from the end of the year and work backwards
         self.chunk_end_date = datetime(self.year, 12, 31, 23, 59, 59)
         self.request_next_chunk()
 
@@ -267,12 +274,17 @@ class IBHistoricalDownloader(EWrapper, EClient):
             self.finish_symbol_download()
             return
 
-        # Cancel any existing timer
+        # Cancel any existing timer for this symbol
         if self.chunk_timer:
             self.chunk_timer.cancel()
+            self.chunk_timer = None
 
         self.data_received = False
-        self.logger.info(f"Requesting chunk {self.chunks_received + 1}/{self.expected_chunks} ending {self.chunk_end_date} for {self.current_symbol}")
+
+        # Generate unique request ID
+        self.current_req_id = hash(f"{self.current_symbol}_{self.chunks_received}_{time.time()}") % 10000
+
+        self.logger.info(f"Requesting chunk {self.chunks_received + 1}/{self.expected_chunks} ending {self.chunk_end_date.strftime('%Y-%m-%d')} for {self.current_symbol}")
 
         try:
             contract = Contract()
@@ -288,15 +300,13 @@ class IBHistoricalDownloader(EWrapper, EClient):
                 if base_symbol == 'BRK':
                     contract.primaryExchange = "NYSE"
 
-            # Set a timeout for this request
-            req_id = hash(f"{self.current_symbol}_{self.chunk_end_date}") % 10000
-            self.chunk_timer = threading.Timer(self.chunk_timeout, self.chunk_timeout_handler, args=[req_id])
-            self.chunk_timer.start()
+            # For current year, we may get limited data - that's OK
+            end_date_str = self.chunk_end_date.strftime("%Y%m%d-%H:%M:%S")
 
             self.reqHistoricalData(
-                reqId=req_id,
+                reqId=self.current_req_id,
                 contract=contract,
-                endDateTime=self.chunk_end_date.strftime("%Y%m%d-%H:%M:%S"),
+                endDateTime=end_date_str,
                 durationStr=self.granularity_map[self.granularity]["chunk_duration"],
                 barSizeSetting=self.granularity_map[self.granularity]["bar_size"],
                 whatToShow="TRADES",
@@ -306,16 +316,21 @@ class IBHistoricalDownloader(EWrapper, EClient):
                 chartOptions=[]
             )
 
+            # Set timeout for this specific request
+            self.chunk_timer = threading.Timer(self.chunk_timeout, self.chunk_timeout_handler, args=[self.current_req_id])
+            self.chunk_timer.start()
+
         except Exception as e:
             self.logger.error(f"Error requesting chunk for {self.current_symbol}: {str(e)}")
             if self.chunk_timer:
                 self.chunk_timer.cancel()
+                self.chunk_timer = None
             self.failed_symbols.append(self.current_symbol)
             self.download_next_symbol()
 
     def chunk_timeout_handler(self, req_id: int):
         """Handle timeout for a chunk request"""
-        if not self.data_received and self.current_symbol:
+        if self.current_req_id == req_id and not self.data_received and self.current_symbol:
             self.logger.error(f"Timeout waiting for data for {self.current_symbol} (reqId: {req_id})")
             # Cancel the historical data request
             try:
@@ -340,6 +355,10 @@ class IBHistoricalDownloader(EWrapper, EClient):
 
     def historicalData(self, reqId: int, bar):
         """Receive historical data bars"""
+        # Check if this is for the current request
+        if reqId != self.current_req_id:
+            return
+
         # Cancel the timeout timer since we received data
         if self.chunk_timer:
             self.chunk_timer.cancel()
@@ -370,6 +389,10 @@ class IBHistoricalDownloader(EWrapper, EClient):
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
         """End of historical data chunk"""
+        # Check if this is for the current request
+        if reqId != self.current_req_id:
+            return
+
         # Cancel any pending timeout timer
         if self.chunk_timer:
             self.chunk_timer.cancel()
@@ -406,6 +429,8 @@ class IBHistoricalDownloader(EWrapper, EClient):
             self.logger.error(f"Error calculating next chunk date: {str(e)}")
             self.chunk_end_date = self.chunk_end_date - timedelta(days=30)
 
+        # Clear current_req_id before next request
+        self.current_req_id = None
         self.request_next_chunk()
 
     def finish_symbol_download(self):
@@ -414,14 +439,14 @@ class IBHistoricalDownloader(EWrapper, EClient):
         if self.chunk_timer:
             self.chunk_timer.cancel()
             self.chunk_timer = None
+        self.current_req_id = None
 
         if not self.all_bars:
             # If we got no data at all, check if we already tried different approaches
             if self.current_retry < self.max_retries:
                 self.current_retry += 1
                 self.logger.info(f"Retry {self.current_retry}/{self.max_retries} for {self.current_symbol} with different settings")
-
-                # Try with different exchange or primary exchange
+                # Reset and try again
                 self.chunk_end_date = datetime(self.year, 12, 31, 23, 59, 59)
                 self.chunks_received = 0
                 self.all_bars = []
@@ -488,13 +513,13 @@ class IBHistoricalDownloader(EWrapper, EClient):
 
     def error(self, reqId: int, errorTime: int, errorCode: int, errorString: str, advancedOrderRejectJson=""):
         """Handle errors from TWS/IB Gateway"""
-        # Cancel timeout timer if there's an error
-        if self.chunk_timer:
+        # Cancel timeout timer if there's an error for the current request
+        if reqId == self.current_req_id and self.chunk_timer:
             self.chunk_timer.cancel()
             self.chunk_timer = None
 
         # Informational messages (ignore)
-        if errorCode in [2104, 2106, 2158, 2107, 2108]:
+        if errorCode in [2104, 2106, 2158, 2107, 2108, 2109]:
             self.logger.info(f"Info {errorCode}: {errorString}")
             return
 
@@ -521,10 +546,20 @@ class IBHistoricalDownloader(EWrapper, EClient):
                 self.download_next_symbol()
             return
 
+        # Historical data service error (might be temporary)
+        elif errorCode == 165:
+            self.logger.warning(f"Historical data service busy: {errorString}")
+            # Retry after a delay
+            time.sleep(2)
+            if self.current_retry < self.max_retries:
+                self.current_retry += 1
+                self.request_next_chunk()
+            return
+
         # General errors
         else:
             self.logger.error(f"Error {errorCode}: {errorString}")
-            if reqId != -1 and self.current_symbol:
+            if reqId != -1 and self.current_symbol and reqId == self.current_req_id:
                 self.logger.error(f"Fatal error for {self.current_symbol}, moving to next symbol")
                 if self.current_symbol not in self.failed_symbols:
                     self.failed_symbols.append(self.current_symbol)
@@ -659,7 +694,7 @@ def parse_arguments():
 
     parser.add_argument(
         '--year',
-        type=str,  # Changed from int to str
+        type=str,
         required=True,
         help='Year or year range to download data for (e.g., "2022" or "2001-2026")'
     )
@@ -796,13 +831,13 @@ def main():
         app.chunk_timeout = args.chunk_timeout
 
         # Connect to TWS/IB Gateway
-        app.connect(args.host, args.port, clientId=args.client_id + year_idx)  # Different client ID per year
+        app.connect(args.host, args.port, clientId=args.client_id + year_idx)
 
         api_thread = threading.Thread(target=app.run, daemon=True)
         api_thread.start()
 
         # Wait for connection and resume check to complete
-        time.sleep(2)
+        time.sleep(3)
 
         # If resume is enabled and we've already downloaded everything for this year, skip
         if args.resume and len(app.symbols) == 0:
@@ -814,7 +849,7 @@ def main():
             continue
 
         remaining_symbols = len(app.symbols)
-        total_timeout = remaining_symbols * timeout_per_symbol
+        total_timeout = remaining_symbols * timeout_per_symbol + 60  # Add buffer
         start_time = time.time()
 
         print(f"\nYear {year}: {remaining_symbols} symbols to download")
@@ -828,15 +863,16 @@ def main():
             if app.download_complete.is_set():
                 break
 
-            # Show progress every 30 seconds
+            # Show progress every 10 seconds
             current_completed = len(app.completed_symbols)
             current_failed = len(app.failed_symbols) + len(app.invalid_symbols) + len(app.no_data_symbols) + len(app.timeout_symbols)
 
             if current_completed + current_failed > last_completed + last_failed:
                 elapsed = time.time() - start_time
-                pct = ((current_completed + current_failed) / remaining_symbols) * 100 if remaining_symbols > 0 else 0
+                total_processed = current_completed + current_failed
+                pct = (total_processed / remaining_symbols) * 100 if remaining_symbols > 0 else 0
                 print(f"\rYear {year} progress: {current_completed} completed, {current_failed} failed, "
-                      f"{remaining_symbols - current_completed - current_failed} remaining "
+                      f"{remaining_symbols - total_processed} remaining "
                       f"({pct:.1f}%) elapsed: {elapsed:.0f}s", end="", flush=True)
                 last_completed = current_completed
                 last_failed = current_failed
@@ -848,7 +884,7 @@ def main():
             if total_processed >= len(app.original_symbols):
                 break
 
-            time.sleep(1)
+            time.sleep(2)
 
         print()  # New line after progress
 
@@ -872,7 +908,8 @@ def main():
     print(f"Symbols per year: {len(symbols)}")
     print(f"Total symbol-years attempted: {total_symbols_attempted}")
     print(f"Total symbol-years downloaded: {total_symbols_downloaded}")
-    print(f"Overall success rate: {(total_symbols_downloaded/total_symbols_attempted)*100:.1f}%")
+    if total_symbols_attempted > 0:
+        print(f"Overall success rate: {(total_symbols_downloaded/total_symbols_attempted)*100:.1f}%")
     print("="*80)
 
 
